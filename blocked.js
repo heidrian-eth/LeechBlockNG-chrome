@@ -6,17 +6,6 @@ const browser = chrome;
 
 var gBlockedURL;
 var gBlockedSet;
-var gHashCode;
-
-// Create 32-bit integer hash code from string
-//
-function hashCode32(str) {
-	let hash = 0;
-	for (let i = 0; i < str.length; i++) {
-		hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0;
-	}
-	return hash;
-}
 
 // Processes info for blocking page
 //
@@ -25,7 +14,6 @@ function processBlockInfo(info) {
 
 	gBlockedURL = info.blockedURL;
 	gBlockedSet = info.blockedSet;
-	gHashCode = info.password ? hashCode32(info.password) : 0;
 
 	// Set theme
 	let themeLink = document.getElementById("themeLink");
@@ -77,8 +65,14 @@ function processBlockInfo(info) {
 	let passwordInput = document.getElementById("lbPasswordInput");
 	let passwordSubmit = document.getElementById("lbPasswordSubmit");
 	if (passwordInput && passwordSubmit) {
-		passwordInput.focus();
-		passwordSubmit.onclick = onSubmitPassword;
+		// No password configured means no password can ever be accepted
+		let enabled = (info.passwordRequired !== false);
+		passwordInput.disabled = !enabled;
+		passwordSubmit.disabled = !enabled;
+		if (enabled) {
+			passwordInput.focus();
+			passwordSubmit.onclick = onSubmitPassword;
+		}
 	}
 
 	let customMsgDiv = document.getElementById("lbCustomMsgDiv");
@@ -158,15 +152,21 @@ function onCountdownTimer(countdown) {
 //
 function onSubmitPassword() {
 	let passwordInput = document.getElementById("lbPasswordInput");
-	if (hashCode32(passwordInput.value) == gHashCode) {
-		// Notify extension that password was successfully entered
-		let message = {
-			type: "password",
-			blockedURL: gBlockedURL,
-			blockedSet: gBlockedSet
-		};
-		browser.runtime.sendMessage(message);
-	} else {
+
+	// Ask extension to check password (it is never held by this page)
+	let message = {
+		type: "password",
+		password: passwordInput.value,
+		blockedURL: gBlockedURL,
+		blockedSet: gBlockedSet
+	};
+	browser.runtime.sendMessage(message).then(onCheckedPassword, function (error) {});
+
+	function onCheckedPassword(response) {
+		if (response && response.allowed) {
+			return; // extension will load the blocked page
+		}
+
 		// Clear input field and flash background
 		passwordInput.value = "";
 		passwordInput.classList.add("error");
@@ -183,4 +183,29 @@ function reloadBlockedPage() {
 }
 
 // Request block info from extension
-browser.runtime.sendMessage({ type: "blocked" }).then(processBlockInfo);
+//
+// Right after a service worker restart the extension has not loaded its
+// options yet and refuses to answer, so retry before giving up on the page.
+function requestBlockInfo(attempt) {
+	browser.runtime.sendMessage({ type: "blocked" }).then(onGot, onError);
+
+	function onGot(info) {
+		if (info) {
+			processBlockInfo(info);
+		} else {
+			retry();
+		}
+	}
+
+	function onError(error) {
+		retry();
+	}
+
+	function retry() {
+		if (attempt < 10) {
+			window.setTimeout(requestBlockInfo, 500, attempt + 1);
+		}
+	}
+}
+
+requestBlockInfo(0);

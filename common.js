@@ -233,6 +233,7 @@ function getParsedURL(url) {
 			origin: origin,
 			protocol: protocol,
 			host: host,
+			port: port,
 			pathNoArgs: path,
 			path: query ? (path + query) : path,
 			query: query,
@@ -247,6 +248,7 @@ function getParsedURL(url) {
 			origin: null,
 			protocol: null,
 			host: null,
+			port: null,
 			pathNoArgs: null,
 			path: null,
 			query: null,
@@ -254,6 +256,32 @@ function getParsedURL(url) {
 			hash: null
 		};
 	}
+}
+
+// Return canonical origin of URL, or null if it has none
+//
+// This deliberately uses the URL parser rather than PARSE_URL. PARSE_URL reads
+// the userinfo of "https://trusted.example@evil.example/" as the host, which
+// would make an origin comparison built on it trivially spoofable. The URL
+// parser also normalises default ports, punycode and IPv6 literals.
+//
+function getURLOrigin(url) {
+	try {
+		let origin = new URL(url).origin;
+		return (origin && origin != "null") ? origin : null;
+	} catch (e) {
+		return null; // not a parsable absolute URL
+	}
+}
+
+// Return names of the options that hold a password in cleartext
+//
+function getPasswordOptions() {
+	let names = ["password", "orp"];
+	for (let set = 1; set <= MAX_SETS; set++) {
+		names.push(`passwordSetSpec${set}`);
+	}
+	return names;
 }
 
 // Clean list of sites
@@ -564,9 +592,20 @@ function decodeDays(dayCode) {
 function createAccessCode(len) {
 	// Omit O, 0, I, l to avoid ambiguity with some fonts
 	const codeChars = "~!@#$%^&*()[]{}?+-=ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz123456789";
+	// Use crypto RNG (not Math.random) with rejection sampling to avoid bias
+	const limit = 256 - (256 % codeChars.length);
+	let bytes = new Uint8Array(len * 2);
+	let index = bytes.length;
 	let code = "";
-	for (let i = 0; i < len; i++) {
-		code += codeChars.charAt(Math.random() * codeChars.length);
+	while (code.length < len) {
+		if (index >= bytes.length) {
+			crypto.getRandomValues(bytes);
+			index = 0;
+		}
+		let byte = bytes[index++];
+		if (byte < limit) {
+			code += codeChars.charAt(byte % codeChars.length);
+		}
 	}
 	return code;
 }

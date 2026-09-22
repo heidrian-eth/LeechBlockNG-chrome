@@ -6,7 +6,17 @@ importScripts("common.js");
 
 const browser = chrome;
 
+const PASSWORD_MAX_ATTEMPTS = 5;
+const PASSWORD_LOCKOUT_SECS = 60;
+
+// Failed password attempts per block set. Keyed by set rather than by tab so
+// that the limit cannot be reset simply by opening another tab.
+var gPasswordLimits = {};
+
 const BLOCKABLE_URL = /^(http|file|chrome|edge|extension)/i;
+// Same schemes as BLOCKABLE_URL but anchored at the colon, so that neither a
+// lookalike scheme ("httpfoo:") nor "javascript:" can be redirected to
+const ALLOWED_REDIRECT_SCHEME = /^(https?|file|chrome-extension|edge-extension|chrome|edge|extension):/i;
 const CLOCKABLE_URL = /^(http|file)/i;
 const EXTENSION_URL = browser.runtime.getURL("");
 const BLOCKED_PAGE_URL = browser.runtime.getURL(BLOCKED_PAGE);
@@ -47,6 +57,8 @@ function initTab(id) {
 			allowedPath: null,
 			allowedSet: 0,
 			allowedEndTime: 0,
+			keyword: null,
+			keywordSet: 0,
 			referrer: "",
 			url: "about:blank",
 			incog: false,
@@ -62,18 +74,26 @@ function initTab(id) {
 // Create (precompile) regular expressions
 //
 function createRegExps() {
+	// An invalid expression (from imported options) must not throw here, or it
+	// takes the whole worker down with it and nothing gets blocked at all
+	function compile(re) {
+		try {
+			return re ? new RegExp(re, "i") : null;
+		} catch (e) {
+			warn("Ignoring invalid regular expression: " + re);
+			return null;
+		}
+	}
+
 	// Create new RegExp objects
 	for (let set = 1; set <= gNumSets; set++) {
 		gRegExps[set] = {};
 
-		let blockRE = gOptions[`regexpBlock${set}`] || gOptions[`blockRE${set}`];
-		gRegExps[set].block = blockRE ? new RegExp(blockRE, "i") : null;
+		gRegExps[set].block = compile(gOptions[`regexpBlock${set}`] || gOptions[`blockRE${set}`]);
 
-		let allowRE = gOptions[`regexpAllow${set}`] || gOptions[`allowRE${set}`];
-		gRegExps[set].allow = allowRE ? new RegExp(allowRE, "i") : null;
+		gRegExps[set].allow = compile(gOptions[`regexpAllow${set}`] || gOptions[`allowRE${set}`]);
 
-		let referRE = gOptions[`referRE${set}`];
-		gRegExps[set].refer = referRE ? new RegExp(referRE, "i") : null;
+		gRegExps[set].refer = compile(gOptions[`referRE${set}`]);
 
 		let keywordRE = gOptions[`regexpKeyword${set}`] || gOptions[`keywordRE${set}`];
 		gRegExps[set].keyword = keywordRE; // Chrome workaround
@@ -89,6 +109,121 @@ function testURL(url, referrer, blockRE, allowRE, referRE, allowRefers) {
 	return allowRefers
 		? block && !(allow || refer)	// refer as allow-condition
 		: (block || refer) && !allow;	// refer as block-condition
+}
+
+// Determine whether message came from one of this extension's own pages
+//
+function isExtensionSender(sender) {
+	if (!sender || sender.id != browser.runtime.id) {
+		return false;
+	}
+
+	// Extension pages (options, popup, ...) share this extension's origin
+	if (sender.url && sender.url.startsWith(EXTENSION_URL)) {
+		return true;
+	}
+
+	// A content script always has an associated tab, so a tab-less sender from
+	// this extension is an internal context (e.g. the offscreen ticker)
+	return !sender.tab;
+}
+
+// Determine which block sets a message from a blocking page may act on
+//
+// blocked.js is injected into ANY page whose URL contains "lb-custom" (see
+// manifest.json), so without this check any website could request block info,
+// guess passwords, or unblock itself.
+//
+// Returns null if the sender is not a legitimate blocking page, true if it is
+// one of this extension's own pages (no restriction), or the list of sets
+// whose configured custom blocking page shares the sender's origin. An origin
+// configured for one set must not be able to read or unblock another.
+//
+function getBlockPageSets(sender) {
+	if (!sender) {
+		return null;
+	}
+
+	if (isExtensionSender(sender)) {
+		return true;
+	}
+
+	if (!gGotOptions || sender.frameId !== 0) {
+		return null; // options not loaded yet, or not a top-level document
+	}
+
+	// sender.origin is the real security origin; sender.url is not, e.g. for a
+	// sandboxed document it stays https:// while the origin is opaque
+	let origin = sender.origin || getURLOrigin(sender.url);
+	if (!origin || origin == "null") {
+		return null;
+	}
+
+	let sets = [];
+	for (let set = 1; set <= gNumSets; set++) {
+		let blockURL = gOptions[`blockURL${set}`];
+		if (blockURL && getURLOrigin(blockURL) == origin) {
+			sets.push(set);
+		}
+	}
+
+	return sets.length ? sets : null;
+}
+
+// Determine whether sender is permitted to act on specified block set
+//
+function isSetAllowed(sets, set) {
+	return sets === true || sets.includes(+set);
+}
+
+// Get password required to access pages blocked by specified set
+//
+function getSetPassword(set) {
+	let passwordRequire = gOptions[`passwordRequire${set}`];
+	if (passwordRequire == 1) {
+		return gOptions["orp"]; // override password
+	} else if (passwordRequire == 2) {
+		return gOptions["password"]; // access control password
+	}
+	return gOptions[`passwordSetSpec${set}`]; // set-specific password
+}
+
+// Check password submitted by blocking page (returns true if correct)
+//
+// The password itself is never sent to the blocking page, and attempts are
+// rate-limited per block set so that the page cannot be used as a guessing
+// oracle.
+//
+function checkSetPassword(set, password) {
+	set = +set;
+	if (!gGotOptions || !Number.isInteger(set) || set < 1 || set > gNumSets) {
+		return false;
+	}
+
+	let now = Date.now();
+	let limit = gPasswordLimits[set];
+	if (!limit) {
+		limit = gPasswordLimits[set] = { attempts: 0, lockout: 0 };
+	}
+
+	if (limit.lockout > now) {
+		return false; // too many failed attempts
+	}
+
+	let expected = getSetPassword(set);
+
+	if (!expected || !password || password !== expected) {
+		if (++limit.attempts >= PASSWORD_MAX_ATTEMPTS) {
+			limit.attempts = 0;
+			limit.lockout = now + (PASSWORD_LOCKOUT_SECS * 1000);
+		}
+		return false;
+	}
+
+	limit.attempts = 0;
+	limit.lockout = 0;
+
+	return true;
 }
 
 // Refresh menus
@@ -182,8 +317,9 @@ function refreshMenus() {
 function refreshTicker() {
 	let processTabsSecs = +gOptions["processTabsSecs"];
 	
-	// Send message to ticker (offscreen document)
-	browser.runtime.sendMessage({ type: "ticker", tickerSecs: processTabsSecs });
+	// Send message to ticker (offscreen document), which may not exist yet
+	browser.runtime.sendMessage({ type: "ticker", tickerSecs: processTabsSecs })
+			.catch(function (error) {});
 }
 
 // Retrieve options from storage
@@ -723,6 +859,7 @@ function checkTab(id, isBeforeNav, isRepeat) {
 						);
 					} else {
 						gTabs[id].keyword = keyword;
+						gTabs[id].keywordSet = set;
 						gTabs[id].url = blockURL; // prevent reload loop on Chrome
 
 						if (browser.history && addHistory && !isInternalPage) {
@@ -1095,7 +1232,9 @@ function updateIcon() {
 
 // Create info for blocking page
 //
-function createBlockInfo(id, url) {
+function createBlockInfo(id, url, allowedSets) {
+	initTab(id);
+
 	// Get theme
 	let theme = gOptions["theme"];
 
@@ -1113,6 +1252,12 @@ function createBlockInfo(id, url) {
 
 	// Get block set and URL (including hash part) of blocked page
 	let blockedSet = parsedURL.args.shift();
+
+	if (!isSetAllowed(allowedSets, blockedSet)) {
+		warn("Cannot create block info: set " + blockedSet + " not allowed.");
+		return { theme: theme, customStyle: customStyle };
+	}
+
 	let blockedSetName = gOptions[`setName${blockedSet}`];
 	let blockedURL = parsedURL.query.substring(blockedSet.length + 2); // retains original separators (& or ;)
 	if (parsedURL.hash != null) {
@@ -1122,17 +1267,16 @@ function createBlockInfo(id, url) {
 	// Get disable link option
 	let disableLink = gOptions["disableLink"];
 
-	// Get keyword match (if applicable)
-	let keywordMatch = gOptions[`showKeyword${blockedSet}`] ? gTabs[id].keyword : null;
+	// Get keyword match (if applicable). gTabs[id].keyword holds whichever set
+	// matched last, so a page must not be handed another set's stale keyword.
+	let keywordMatch = (gOptions[`showKeyword${blockedSet}`]
+			&& gTabs[id].keywordSet == blockedSet)
+			? gTabs[id].keyword
+			: null;
 
-	// Get password
-	let passwordRequire = gOptions[`passwordRequire${blockedSet}`];
-	let password = gOptions[`passwordSetSpec${blockedSet}`]; // set-specific password
-	if (passwordRequire == 1) {
-		password = gOptions["orp"]; // override password
-	} else if (passwordRequire == 2) {
-		password = gOptions["password"]; // access control password
-	}
+	// Report only WHETHER a password is required; the password itself is never
+	// sent to the blocking page (it is verified here, in checkSetPassword)
+	let passwordRequired = !!getSetPassword(blockedSet);
 
 	// Get custom message
 	let customMsg = gOptions[`customMsg${blockedSet}`];
@@ -1175,7 +1319,7 @@ function createBlockInfo(id, url) {
 		blockedURL: blockedURL,
 		disableLink: disableLink,
 		keywordMatch: keywordMatch,
-		password: password,
+		passwordRequired: passwordRequired,
 		customMsg: customMsg,
 		unblockTime: unblockTime,
 		delaySecs: delaySecs,
@@ -1502,12 +1646,37 @@ function openExtensionPage(url) {
 function allowBlockedPage(id, url, set, autoLoad) {
 	//log("allowBlockedPage: " + id + " " + url + " " + set);
 
-	if (!gGotOptions || set < 1 || set > gNumSets) {
+	set = +set;
+	if (!gGotOptions || !Number.isInteger(set) || set < 1 || set > gNumSets) {
 		return;
 	}
 
-	// Get parsed URL for this page
+	// The URL comes from the blocking page, so check it before touching any
+	// state: a real scheme from the allowed list, and a host we can parse
+	if (!url || !ALLOWED_REDIRECT_SCHEME.test(url)) {
+		return;
+	}
+
 	let parsedURL = getParsedURL(url);
+	if (!parsedURL.host) {
+		return;
+	}
+
+	// PARSE_URL reads the host of "https://target.example@evil.example/" as
+	// target.example, so on its own it would whitelist a site the user never
+	// saw a blocking page for. Cross-check it against the real URL parser.
+	let realHost;
+	try {
+		realHost = new URL(url).hostname;
+	} catch (e) {
+		return;
+	}
+	if (realHost && realHost.toLowerCase() != parsedURL.host.toLowerCase()) {
+		warn("Refusing allowance: host mismatch for " + url);
+		return;
+	}
+
+	initTab(id);
 
 	// Set parameters for allowing host
 	let delayFirst = gOptions[`delayFirst${set}`];
@@ -1655,23 +1824,25 @@ function addSitesToSet(siteList, set) {
 function checkManagedStorage() {
 	//log("checkManagedStorage");
 
-	if (browser.storage.managed) {
-		browser.storage.managed.get().then(onGot, onError);
+	if (!browser.storage.managed) {
+		return Promise.resolve();
+	}
 
-		function onGot(data) {
-			browser.storage.local.set(data).then(
-				() => {
-					log("Copied options from managed to local storage.");
-				},
-				(error) => {
-					warn("Cannot copy options from managed to local storage: " + error);
-				}
-			);
-		}
+	return browser.storage.managed.get().then(onGot, onError);
 
-		function onError(error) {
-			warn("No options available from managed storage: " + error);
-		}
+	function onGot(data) {
+		return browser.storage.local.set(data).then(
+			() => {
+				log("Copied options from managed to local storage.");
+			},
+			(error) => {
+				warn("Cannot copy options from managed to local storage: " + error);
+			}
+		);
+	}
+
+	function onError(error) {
+		warn("No options available from managed storage: " + error);
 	}
 }
 
@@ -1747,6 +1918,48 @@ function handleMessage(message, sender, sendResponse) {
 
 	//log("handleMessage: " + sender.tab.id + " " + message.type);
 
+	// Messages that act on the extension's own state are accepted only from
+	// the extension's own pages; messages from a blocking page are accepted
+	// only from this extension or a configured custom blocking page origin
+	let blockPageSets = null;
+
+	switch (message.type) {
+
+		case "add-sites":
+		case "close":
+		case "discard-time":
+		case "lockdown":
+		case "options":
+		case "override":
+		case "reset-rollover":
+		case "restart":
+		case "tick":
+			if (!isExtensionSender(sender)) {
+				warn("Ignoring '" + message.type + "' message from: " + sender.url);
+				return;
+			}
+			break;
+
+		case "blocked":
+		case "delayed":
+		case "password":
+			blockPageSets = getBlockPageSets(sender);
+			if (!blockPageSets) {
+				warn("Ignoring '" + message.type + "' message from: " + sender.url);
+				return;
+			}
+			// These act on a set named by the page, which must be one of the
+			// sets this origin is actually configured to display
+			if (message.type != "blocked"
+					&& !isSetAllowed(blockPageSets, message.blockedSet)) {
+				warn("Ignoring '" + message.type + "' message for set "
+						+ message.blockedSet + " from: " + sender.url);
+				return;
+			}
+			break;
+
+	}
+
 	switch (message.type) {
 
 		case "add-sites":
@@ -1756,7 +1969,7 @@ function handleMessage(message, sender, sendResponse) {
 
 		case "blocked":
 			// Block info requested by blocking page
-			let info = createBlockInfo(sender.tab.id, sender.url);
+			let info = createBlockInfo(sender.tab.id, sender.url, blockPageSets);
 			sendResponse(info);
 			break;
 
@@ -1780,11 +1993,13 @@ function handleMessage(message, sender, sendResponse) {
 
 		case "focus":
 			// Tab focus event received
+			initTab(sender.tab.id);
 			gTabs[sender.tab.id].focused = message.focus;
 			break;
 
 		case "loaded":
 			// Register that content script has been loaded
+			initTab(sender.tab.id);
 			gTabs[sender.tab.id].loaded = true;
 			gTabs[sender.tab.id].loadedTime = Date.now();
 			gTabs[sender.tab.id].url = getCleanURL(message.url);
@@ -1812,15 +2027,20 @@ function handleMessage(message, sender, sendResponse) {
 			break;
 
 		case "password":
-			// Password successfully entered
-			allowBlockedPage(sender.tab.id,
-					message.blockedURL,
-					message.blockedSet,
-					true);
+			// Password submitted by blocking page (verified here, not there)
+			let allowed = checkSetPassword(message.blockedSet, message.password);
+			if (allowed) {
+				allowBlockedPage(sender.tab.id,
+						message.blockedURL,
+						message.blockedSet,
+						true);
+			}
+			sendResponse({ allowed: allowed });
 			break;
 
 		case "referrer":
 			// URL of referring page received
+			initTab(sender.tab.id);
 			gTabs[sender.tab.id].referrer = message.referrer;
 			break;
 
@@ -1993,7 +2213,10 @@ async function createTicker() {
 
 /*** STARTUP CODE BEGINS HERE ***/
 
-checkManagedStorage();
+// Load options immediately: the worker can restart at any time, and until
+// gGotOptions is set every blocking page is (correctly) refused. Managed
+// storage is copied into local storage first so it is not read a tick late.
+checkManagedStorage().then(() => retrieveOptions(), () => retrieveOptions());
 
 browser.runtime.getPlatformInfo().then(
 	function (info) { gIsAndroid = (info.os == "android"); }
