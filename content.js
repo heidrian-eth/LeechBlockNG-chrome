@@ -4,6 +4,8 @@
 
 const browser = chrome;
 
+function warn(message) { console.warn("[LBNG] " + message); }
+
 const TIMER_SIZES = ["10px", "12px", "14px", "16px"];
 
 const TIMER_LOCATIONS = [
@@ -169,7 +171,15 @@ function handleMessage(message, sender, sendResponse) {
 			break;
 
 		case "keyword":
-			let keyword = checkKeyword(new RegExp(message.keywordRE, "iu"), message.titleOnly); // Chrome workaround
+			let keyword = null;
+			try {
+				// Chrome workaround: the expression is compiled here, and an
+				// invalid one (from imported options) must not throw, or the
+				// background script never gets an answer for this page
+				keyword = checkKeyword(new RegExp(message.keywordRE, "iu"), message.titleOnly);
+			} catch (e) {
+				warn("Ignoring invalid keyword expression: " + message.keywordRE);
+			}
 			sendResponse(keyword);
 			break;
 

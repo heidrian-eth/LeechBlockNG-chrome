@@ -477,7 +477,7 @@ function saveOptions(event) {
 	} else {
 		// Export options to sync storage if selected
 		if (options["autoExportSync"] && !gIsAndroid) {
-			exportOptionsSync(); // no event passed, so dialogs suppressed
+			exportOptionsSync(null, false); // no event passed, so dialogs suppressed
 		}
 
 		// Set all options in local storage
@@ -551,7 +551,7 @@ function retrieveOptions() {
 			let aptMinPeriods = getMinPeriods(apt);
 			for (let mp of aptMinPeriods) {
 				if (mins >= mp.start && mins < mp.end) {
-					$("#alertAccessPreventTimes").html(apt);
+					$("#alertAccessPreventTimes").text(apt);
 					$("#alertAccessPrevent").dialog("open");
 					$("#alertAccessPrevent").on("dialogclose", closeOptions);
 					return;
@@ -795,7 +795,7 @@ function showClockOffsetTime() {
 		$("#clockOffsetTime").css("display", "none");
 	} else {
 		let timedate = new Date(Date.now() + (clockOffset * 60000));
-		$("#clockOffsetTime").html(timedate.toLocaleString(undefined, gClockTimeOpts));
+		$("#clockOffsetTime").text(timedate.toLocaleString(undefined, gClockTimeOpts));
 		$("#clockOffsetTime").css("display", "inline");
 	}
 }
@@ -851,6 +851,42 @@ function compileExportOptions(passwords) {
 	}
 
 	return options;
+}
+
+// Apply imported options, keeping any password the import omitted
+//
+// Password export is off by default, so most backups have no password keys.
+// cleanOptions() fills a missing option with its default (blank), which would
+// silently wipe the access, override and per-set passwords on import.
+//
+function cleanAndApplyImportOptions(options) {
+	// applyImportOptions() rebuilds the form from pristine HTML, so the
+	// current values have to be read first and put back into the options
+	let kept = {};
+	for (let name of getPasswordOptions()) {
+		if (options[name] != undefined) continue;
+		let field = getElement(getPasswordOptionId(name));
+		if (field) {
+			kept[name] = escape(field.value);
+		}
+	}
+
+	cleanOptions(options);
+
+	for (let name in kept) {
+		options[name] = kept[name];
+	}
+
+	applyImportOptions(options);
+}
+
+// Return the form field id for a password option
+//
+function getPasswordOptionId(name) {
+	let perSet = /^(passwordSetSpec)(\d+)$/.exec(name);
+	return perSet
+			? PER_SET_OPTIONS[perSet[1]].id + perSet[2]
+			: GENERAL_OPTIONS[name].id;
 }
 
 // Apply imported options
@@ -1001,16 +1037,7 @@ function importOptions() {
 			return;
 		}
 
-		// Preserve passwords if not imported
-		if (options["password"] == undefined) {
-			options["password"] = getElement("accessPassword").value;
-		}
-		if (options["orp"] == undefined) {
-			options["orp"] = getElement("overridePassword").value;
-		}
-
-		cleanOptions(options);
-		applyImportOptions(options);
+		cleanAndApplyImportOptions(options);
 
 		$("#tabs").tabs("option", "active", gNumSets);
 		$("#alertImportSuccess").dialog("open");
@@ -1037,10 +1064,34 @@ function exportOptionsJSON() {
 
 // Export options to sync storage
 //
-function exportOptionsSync(event) {
-	let options = compileExportOptions(true);
+function exportOptionsSync(event, syncPrimary) {
+	// Honour the same opt-in as the file exports: passwords are stored in
+	// cleartext, and this runs automatically on every save (autoExportSync)
+	let exportPasswords = getElement("exportPasswords").checked;
 
-	browser.storage.sync.set(options).then(onSuccess, onError);
+	let options = compileExportOptions(exportPasswords);
+
+	browser.storage.sync.set(options).then(purgePasswords).then(onSuccess, onError);
+
+	// Earlier versions uploaded passwords unconditionally, so skipping them
+	// here is not enough: delete any copies already in sync storage. Skip this
+	// when sync storage is the primary store, where those keys are the live
+	// passwords rather than a backup copy.
+	function purgePasswords() {
+		if (exportPasswords) {
+			return;
+		}
+
+		// The caller knows whether sync is the primary store; reading it back
+		// from local storage can race with the save that is writing it
+		let isPrimary = (syncPrimary != undefined)
+				? syncPrimary
+				: getElement("syncStorage").checked;
+
+		return isPrimary
+				? null
+				: browser.storage.sync.remove(getPasswordOptions());
+	}
 
 	function onSuccess() {
 		if (event) {
@@ -1062,8 +1113,7 @@ function importOptionsSync(event) {
 	browser.storage.sync.get().then(onGot, onError);
 
 	function onGot(options) {
-		cleanOptions(options);
-		applyImportOptions(options);
+		cleanAndApplyImportOptions(options);
 
 		if (event) {
 			$("#tabs").tabs("option", "active", gNumSets);

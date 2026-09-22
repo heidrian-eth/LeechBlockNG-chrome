@@ -85,8 +85,8 @@ function initializePage() {
 			let now = Math.floor(Date.now() / 1000) + (gClockOffset * 60);
 			let periodStart = getTimePeriodStart(now, orlp);
 			if (orlps == periodStart && gOverrideLimitLeft == 0) {
-				$("#alertLimitNum").html(orln);
-				$("#alertLimitReachedPeriod").html(gOverrideLimitPeriod);
+				$("#alertLimitNum").text(orln);
+				$("#alertLimitReachedPeriod").text(gOverrideLimitPeriod);
 				$("#alertLimitReached").dialog("open");
 				return;
 			} else if (orlps != periodStart) {
@@ -282,16 +282,23 @@ function activateOverride() {
 	if (gOverrideConfirm) {
 		// Show confirmation dialog
 		endTime = new Date(endTime * 1000);
-		$("#alertOverrideEndTime").html(endTime.toLocaleTimeString(undefined, gClockTimeOpts));
+		$("#alertOverrideEndTime").text(endTime.toLocaleTimeString(undefined, gClockTimeOpts));
 		if (gOverrideSetNames.length > 0) {
 			$("#alertOverrideNoSets").hide();
 			$("#alertOverrideSets").show();
-			$("#alertOverrideSetList").html("<ul><li>" + gOverrideSetNames.join("</li><li>") + "</li></ul>");
+			// Build list as DOM nodes (set names must not be parsed as HTML)
+			let list = document.createElement("ul");
+			for (let setName of gOverrideSetNames) {
+				let item = document.createElement("li");
+				item.textContent = setName;
+				list.appendChild(item);
+			}
+			$("#alertOverrideSetList").empty().append(list);
 		}
 		if (gOverrideLimit) {
 			$("#alertOverrideLimit").show();
-			$("#alertLimitLeft").html(gOverrideLimitLeft - 1);
-			$("#alertLimitPeriod").html(gOverrideLimitPeriod);
+			$("#alertLimitLeft").text(gOverrideLimitLeft - 1);
+			$("#alertLimitPeriod").text(gOverrideLimitPeriod);
 		}
 		$("#alertOverrideActivated").dialog("open");
 	} else {

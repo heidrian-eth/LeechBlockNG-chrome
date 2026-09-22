@@ -15,7 +15,7 @@ function initForm() {
 	//log("initForm");
 
 	// Clear drop-down list of block sets
-	$("#blockSet").html("");
+	$("#blockSet").empty();
 
 	// Set up JQuery UI widgets
 	$("#addSites").button();
@@ -52,16 +52,17 @@ function refreshPage() {
 		setTheme(options["theme"]);
 
 		// Update drop-down list of block sets
-		let blockSetHTML = "";
+		// (built as DOM nodes so set names are not parsed as HTML)
+		let blockSet = getElement("blockSet");
 		for (let set = 1; set <= numSets; set++) {
-			blockSetHTML += `<option value="${set}">Block Set ${set}`;
 			let setName = options[`setName${set}`];
-			if (setName) {
-				blockSetHTML += ` (${setName})`;
-			}
-			blockSetHTML += "</option>";
+			let option = document.createElement("option");
+			option.value = set;
+			option.textContent = setName
+					? `Block Set ${set} (${setName})`
+					: `Block Set ${set}`;
+			blockSet.appendChild(option);
 		}
-		$("#blockSet").html(blockSetHTML);
 
 		$("#form").show();
 	}
